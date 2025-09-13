@@ -1,0 +1,20 @@
+# --- secrets ---
+config.py
+*.env
+# --- databases ---
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+trading.db
+# --- logs / temp ---
+logs/
+tmp/
+*.log
+__pycache__/
+*.pyc
+# --- envs ---
+venv/
+# --- backups & local artifacts ---
+backups/
+upper
