@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import math, time, random
-from datetime import timezone, timedelta
+# removed: timezone,timedelta (unused)
 from statistics import mean
 from sqlalchemy import and_
 
@@ -25,7 +25,6 @@ from models_trading import SessionT, Order, Capital, init_trading_db
 from mexc_client import MexcClient
 from notify import send_error
 
-MSK = timezone(timedelta(hours=3))
 now_ts = lambda: int(time.time())
 
 def _floor6(x: float) -> float:

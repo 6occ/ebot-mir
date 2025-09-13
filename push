@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+
+if [ "$1" == "main" ]; then
+  echo "➡️  Push ONLY to origin/main"
+  git push origin main
+else
+  echo "➡️  Push to origin/dev"
+  git push origin dev
+  echo "➡️  Push to mirror/main"
+  git push mirror main
+fi

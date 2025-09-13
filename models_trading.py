@@ -1,5 +1,5 @@
 # models_trading.py — trading DB models (SQLite + SQLAlchemy)
-from sqlalchemy import create_engine, Column, String, Float, Integer, Boolean, text
+from sqlalchemy import create_engine, Column, String, Float, Integer, Boolean
 from sqlalchemy.orm import sessionmaker, declarative_base
 from contextlib import contextmanager
 from typing import List

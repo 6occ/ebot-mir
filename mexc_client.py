@@ -6,7 +6,7 @@ import hmac
 import hashlib
 import requests
 from urllib.parse import urlencode
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, Tuple
 
 from config import MEXC_API_URL, API_KEY, API_SECRET
 

@@ -16,7 +16,7 @@ from models_trading import (
 )
 from mexc_client import MexcClient
 from config import (
-    PAIR, BASE_ASSET, QUOTE_ASSET,
+    PAIR, QUOTE_ASSET,
     SYNC_WINDOW_MIN, SYNC_OPEN_LIMIT,
 )
 
@@ -93,7 +93,6 @@ def sync_open_orders(sess: SessionT, cli: MexcClient, limit: int) -> None:
                     .filter(and_(Order.pair == PAIR,
                                  Order.status.in_(("NEW","PARTIALLY_FILLED"))))
                     .all())
-    local_by_id = {o.id: o for o in local_open}
 
     # upsert по бирже
     for it in data:

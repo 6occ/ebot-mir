@@ -13,7 +13,7 @@ from config import (
     MAX_CANDLE_GAP, HTTP_TIMEOUT
 )
 from models import SessionLocal, MinMax, init_db
-from notify import send_message, send_error
+from notify import send_error
 
 # --- keepalive ---
 SOCKET_PING_INTERVAL = 15
