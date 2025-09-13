@@ -180,7 +180,6 @@ def on_error(ws, error):
 
 def _handle_term(signum, frame):
     try:
-        global _ws, _hb_stop, _tick_stop
         _hb_stop.set(); _tick_stop.set()
         ws = _ws
         if ws: ws.close()
