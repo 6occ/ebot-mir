@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import os, time, random, subprocess, traceback
 from datetime import datetime
 
@@ -61,9 +60,8 @@ def task_report():
     run_cmd("report", [PYBIN, os.path.join(ROOT, "report.py")])
 
 def task_consolidate():
-    # consolidate.py сам читает лимиты из config.py, дополнительных CLI-флагов не требуется
-    args = [PYBIN, os.path.join(ROOT, "consolidate.py")]
-    run_cmd("consolidate", args)
+    # Без аргументов — вся логика и лимиты внутри consolidate.py / config.py
+    run_cmd("consolidate", [PYBIN, os.path.join(ROOT, "consolidate.py")])
 
 def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -71,10 +69,7 @@ def _now():
 def main():
     # стартовое сообщение
     try:
-        send_message(
-            f"▶️ ebot started | sync={ENABLE_SYNC} buy={ENABLE_BUY} "
-            f"sell={ENABLE_SELL} report={ENABLE_REPORT} consolidate={ENABLE_CONSOLIDATE} | {_now()}"
-        )
+        send_message(f"▶️ ebot started | sync={ENABLE_SYNC} buy={ENABLE_BUY} sell={ENABLE_SELL} report={ENABLE_REPORT} consolidate={ENABLE_CONSOLIDATE} | {_now()}")
     except Exception:
         pass
 
@@ -96,7 +91,6 @@ def main():
     while True:
         now = time.time()
 
-        # sync — чаще всех, проверяем первым
         if ENABLE_SYNC and now >= next_run.get("sync", now + 1e9):
             task_sync()
             next_run["sync"] = time.time() + _jitter(EBOT_SYNC_INTERVAL_SEC)
