@@ -1,208 +1,257 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math, time
+import os, sys, sqlite3, math, time
+from statistics import mean
 from datetime import datetime, timezone, timedelta
 
-from config import (
-    PAIR, BASE_ASSET, QUOTE_ASSET,
-    START_CAPITAL_USD, MAKER_FEE_PCT,
-    REPORT_PERIOD_MIN,
-)
+# --- конфиг ---
+try:
+    from config import DB_PATH, PAIR, START_CAPITAL_USD
+except Exception:
+    DB_PATH = "/opt/Ebot/ebot.db"
+    PAIR = "KASUSDC"
+    START_CAPITAL_USD = 1000.0
 
-from models import SessionLocal, init_db
-from models_trading import (
-    SessionT, init_trading_db,
-    Order, Position, Capital,
-)
-
-MSK = timezone(timedelta(hours=3))
-now_ts = lambda: int(time.time())
-
-def _round(x, n=6):
+# --- уведомления ---
+def _send(text: str) -> None:
     try:
-        return round(float(x), n)
+        from notify import send_message
+        send_message(text)
+    except Exception:
+        # не роняем отчёт, просто молча продолжаем
+        pass
+
+def _fmt_usd(x: float) -> str:
+    s = f"{x:,.2f}"
+    return s.replace(",", " ")
+
+def _fmt_pct(x: float) -> str:
+    return f"{x:.1f}%"
+
+def _row_to_dict(cur, row):
+    return {d[0]: row[i] for i, d in enumerate(cur.description)}
+
+def _now_utc_ts() -> int:
+    return int(time.time())
+
+def _msk_now_str() -> str:
+    # визуальная метка отчёта в MSK
+    return datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%d %H:%M")
+
+def fetch_candles(conn, pair: str, since_sec: int):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT time, min, max, mid, open, close
+        FROM minmax
+        WHERE pair=? AND time>=?
+        ORDER BY time ASC
+    """, (pair, since_sec))
+    rows = cur.fetchall()
+    return rows
+
+def fetch_last_close(conn, pair: str):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT time, close FROM minmax
+        WHERE pair=? ORDER BY time DESC LIMIT 1
+    """, (pair,))
+    r = cur.fetchone()
+    return (r[0], float(r[1])) if r else (None, None)
+
+def fetch_close_at_or_before(conn, pair: str, ts: int):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT time, close FROM minmax
+        WHERE pair=? AND time<=?
+        ORDER BY time DESC LIMIT 1
+    """, (pair, ts))
+    r = cur.fetchone()
+    return (r[0], float(r[1])) if r else (None, None)
+
+def fetch_position(conn, pair: str):
+    # простая позиция (qty, avg) — берём последнюю запись
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT qty, avg FROM positions
+            WHERE pair=? ORDER BY updated DESC LIMIT 1
+        """, (pair,))
+    except Exception:
+        # fallback: некоторые схемы называют updated как 'time'
+        cur.execute("""
+            SELECT qty, avg FROM positions
+            WHERE pair=? ORDER BY time DESC LIMIT 1
+        """, (pair,))
+    r = cur.fetchone()
+    if not r:
+        return 0.0, 0.0
+    qty = float(r[0] or 0.0)
+    avg = float(r[1] or 0.0)
+    return qty, avg
+
+def fetch_open_buy_reserve(conn, pair: str):
+    # резерв по открытым BUY = сумма price*qty
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT COALESCE(SUM(price*qty),0)
+            FROM orders
+            WHERE pair=? AND side='BUY' AND status IN ('NEW','PARTIALLY_FILLED')
+        """, (pair,))
+        r = cur.fetchone()
+        return float(r[0] or 0.0)
     except Exception:
         return 0.0
 
-def _fetch_last_price(sess_core) -> float:
-    # Берём последнюю свечу из core-DB (models.MinMax)
-    from models import MinMax
-    row = (sess_core.query(MinMax)
-           .filter(MinMax.pair == PAIR)
-           .order_by(MinMax.time.desc())
-           .first())
-    if not row:
-        return 0.0
-    return float(row.close if row.close else row.mid or 0.0)
+def fetch_recent_orders_preview(conn, pair: str, limit: int = 10):
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT time, side, price, qty, status
+            FROM orders
+            WHERE pair=?
+            ORDER BY time DESC
+            LIMIT ?
+        """, (pair, limit))
+    except Exception:
+        # альтернативные поля created/updated
+        cur.execute("""
+            SELECT COALESCE(updated,created) AS time, side, price, qty, status
+            FROM orders
+            WHERE pair=?
+            ORDER BY COALESCE(updated,created) DESC
+            LIMIT ?
+        """, (pair, limit))
+    out = []
+    for t, side, price, qty, status in cur.fetchall():
+        dt = datetime.utcfromtimestamp(int(t)).strftime("%H:%M:%S") if t else "--:--:--"
+        out.append(f"{dt} | {side} @ {float(price):.6f} | qty={float(qty):g} | {status}")
+    return out
 
-def _equity_snapshot(sessT, last_price: float):
-    cap = sessT.query(Capital).filter(Capital.pair == PAIR).first()
-    pos = sessT.query(Position).filter(Position.pair == PAIR).first()
-    available = float(cap.available_usd) if cap else 0.0
+def compute_channel_24h(candles):
+    if not candles:
+        return None
+    mins = [float(r[1]) for r in candles if r[1] is not None]
+    maxs = [float(r[2]) for r in candles if r[2] is not None]
+    mids = [float(r[3]) for r in candles if r[3] is not None]
+    if not mins or not maxs:
+        return None
+    mn = min(mins); mx = max(maxs)
+    mid_avg = mean(mids) if mids else (mn + mx) / 2.0
+    spread = max(0.0, mx - mn)
+    lower = max(0.0, mid_avg - spread / 4.0)
+    upper = max(0.0, mid_avg + spread / 4.0)
+    return dict(lower=lower, upper=upper, mid=mid_avg, spread=spread)
 
-    # Резерв под открытые BUY
-    open_buy = (sessT.query(Order)
-                .filter(Order.pair==PAIR,
-                        Order.side=="BUY",
-                        Order.status.in_(("NEW","PARTIALLY_FILLED"))).all())
-    reserved = sum(float(o.reserved or 0.0) for o in open_buy)
+def calc_pnl_blocks(last_px: float, qty: float, avg: float, px_1h: float|None, px_24h: float|None):
+    # 1) краткосрочный PnL считаем по изменению цены * текущий qty
+    def _pnl_win(p0):
+        if p0 is None or last_px is None:
+            return (None, None)
+        abs_usd = (last_px - p0) * qty
+        base = max(1e-9, last_px * qty)
+        pct = (abs_usd / base) * 100.0
+        return (abs_usd, pct)
 
-    qty = float(pos.qty) if pos else 0.0
-    avg = float(pos.avg) if pos else 0.0
-    pos_val = qty * float(last_price)
+    pnl1_abs, pnl1_pct = _pnl_win(px_1h)
+    pnl24_abs, pnl24_pct = _pnl_win(px_24h)
 
-    equity = available + reserved + pos_val
-    return {
-        "available": available,
-        "reserved": reserved,
-        "qty": qty,
-        "avg": avg,
-        "pos_val": pos_val,
-        "equity": equity,
-    }
+    # 2) «Всего» — нереализованный против стартового капитала:
+    #    (last - avg)*qty относительно START_CAPITAL_USD
+    total_abs = (last_px - avg) * qty if (last_px is not None and avg) else 0.0
+    total_pct = (total_abs / max(1e-9, START_CAPITAL_USD)) * 100.0
 
-def _try_sum_amount(sessT, table: str, col_ts: str, since_ts: int):
-    """
-    Возвращает (sum_buy, sum_sell) по таблице table,
-    где сумма считается как Σ(price*qty) по каждому side.
-    """
-    from sqlalchemy import text
-    sql = text(f"""
-        SELECT side, SUM(CAST(price AS REAL) * CAST(qty AS REAL)) AS amt
-        FROM {table}
-        WHERE pair = :pair AND {col_ts} >= :since
-        GROUP BY side
-    """)
-    rows = sessT.execute(sql, {"pair": PAIR, "since": since_ts}).fetchall()
-    sums = {"BUY": 0.0, "SELL": 0.0}
-    for side, amt in rows:
-        if side in ("BUY","SELL") and amt is not None:
-            sums[side] = float(amt)
-    return sums["BUY"], sums["SELL"]
-
-def _pnl_since(sessT, since_minutes: int) -> float:
-    """
-    Реализованный PNL за окно (минут).
-    Пробует:
-      - таблицы: fills, trades
-      - колонки времени: ts, time, created
-    PNL = ΣSELL - ΣBUY - fee*(ΣSELL+ΣBUY)
-    """
-    since_ts = now_ts() - since_minutes * 60
-    tables = ["fills", "trades"]
-    cols   = ["ts", "time", "created"]
-
-    last_err = None
-    for t in tables:
-        for c in cols:
-            try:
-                buy_sum, sell_sum = _try_sum_amount(sessT, t, c, since_ts)
-                gross = sell_sum - buy_sum
-                fees  = MAKER_FEE_PCT * (abs(sell_sum) + abs(buy_sum))
-                return gross - fees
-            except Exception as e:
-                last_err = e
-                continue
-    # Если ничего не нашли/не удалось — считаем 0, но не падаем отчётом
-    return 0.0
-
-def _fmt_money(x: float) -> str:
-    s = f"{x:,.2f}".replace(",", "_").replace("_", " ")
-    return s
-
-def _fmt_pct(x: float) -> str:
-    return f"{x*100:.1f}%"
+    return (pnl1_abs, pnl1_pct, pnl24_abs, pnl24_pct, total_abs, total_pct)
 
 def main():
-    init_db()
-    init_trading_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
 
-    sess_core = SessionLocal()
-    sessT     = SessionT()
+    now = _now_utc_ts()
+    rows24 = fetch_candles(conn, PAIR, now - 24*3600)
+    _, last_px = fetch_last_close(conn, PAIR)
+    t1h = now - 3600
+    t24h = now - 24*3600
+    _, px_1h = fetch_close_at_or_before(conn, PAIR, t1h)
+    _, px_24h = fetch_close_at_or_before(conn, PAIR, t24h)
+
+    ch = compute_channel_24h(rows24)
+    qty, avg = fetch_position(conn, PAIR)
+    reserve_usd = fetch_open_buy_reserve(conn, PAIR)
+
+    position_val = (last_px or 0.0) * qty
+    total_equity_est = START_CAPITAL_USD + (last_px - avg) * qty if avg and last_px else START_CAPITAL_USD
+    # доступный кэш оценочно как equity - позиция - резерв (не идеально, но безопасно)
+    cash_est = max(0.0, total_equity_est - position_val - reserve_usd)
+
+    pnl1_abs, pnl1_pct, pnl24_abs, pnl24_pct, total_abs, total_pct = calc_pnl_blocks(
+        last_px or 0.0, qty, avg, px_1h, px_24h
+    )
+
+    # сборка отчёта
+    lines = []
+    lines.append(f"🧾 Отчёт по {PAIR} (MSK) {_msk_now_str()}")
+    lines.append("Период: 30 мин")
+    lines.append(f"Цена: {last_px:.6f}" if last_px is not None else "Цена: n/a")
+    if ch:
+        lines.append(f"Канал: [{ch['lower']:.6f}..{ch['upper']:.6f}]")
+    else:
+        lines.append("Канал: n/a")
+
+    lines.append("💼 Баланс и позиция")
+    lines.append("Торговля: ON")
+    lines.append(f"Итого: ${_fmt_usd(total_equity_est)}")
+    lines.append(f"Доступно: ${_fmt_usd(cash_est)}")
+    lines.append(f"В ордерах (BUY, резерв): ${_fmt_usd(reserve_usd)}")
+    lines.append(f"Позиция: {qty:g} {PAIR.replace('USDC','')} AVG: {avg:.6f}")
+    lines.append(f"Стоимость позиции: ${_fmt_usd(position_val)}")
+
+    # PNL блок
+    def _fmt_pnl(name, a, p):
+        if a is None or p is None:
+            return f"{name}: n/a"
+        sign = "+" if a >= 0 else ""
+        return f"{name}: {sign}{a:.2f}$ ({sign}{_fmt_pct(p)})"
+
+    lines.append("PNL")
+    lines.append(_fmt_pnl("1 час", pnl1_abs, pnl1_pct))
+    lines.append(_fmt_pnl("24 часа", pnl24_abs, pnl24_pct))
+    lines.append(_fmt_pnl("Всего", total_abs, total_pct))
+
+    # немного статистики по ордерам (не критично)
     try:
-        last = _fetch_last_price(sess_core)
-        snap = _equity_snapshot(sessT, last)
-
-        # PNL окна
-        pnl_1h   = _pnl_since(sessT, 60)
-        pnl_24h  = _pnl_since(sessT, 1440)
-        # PNL всего = текущее equity - стартовый капитал
-        pnl_all  = snap["equity"] - START_CAPITAL_USD
-
-        # Для «процентов» используем относительную базу:
-        # за окна — от START_CAPITAL_USD (как точка отсчёта в README),
-        # «Всего» — тоже от START_CAPITAL_USD.
-        pct_1h  = pnl_1h  / START_CAPITAL_USD if START_CAPITAL_USD else 0.0
-        pct_24h = pnl_24h / START_CAPITAL_USD if START_CAPITAL_USD else 0.0
-        pct_all = pnl_all / START_CAPITAL_USD if START_CAPITAL_USD else 0.0
-
-        # Канал (берём по формуле из minmax за 24ч)
-        from statistics import mean
-        from models import MinMax
-        cutoff = now_ts() - 86400
-        rows = (sess_core.query(MinMax)
-                .filter(MinMax.pair==PAIR, MinMax.time>=cutoff).all())
-        if rows:
-            mn = min(r.min for r in rows)
-            mx = max(r.max for r in rows)
-            mid24 = mean(r.mid for r in rows)
-            spread = max(0.0, (mx - mn))
-            lower = max(0.0, mid24 - spread/4.0)
-            upper = max(0.0, mid24 + spread/4.0)
-        else:
-            lower = upper = 0.0
-
-        # Текст отчёта
-        ts = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
-        lines = []
-        lines.append(f"🧾 Отчёт по {PAIR} (MSK) {ts}\n")
-        lines.append(f"Период: {REPORT_PERIOD_MIN} мин")
-        lines.append(f"Цена: {last:.6f}")
-        if lower and upper:
-            lines.append(f"Канал: [{_round(lower,6)}..{_round(upper,6)}]\n")
-        else:
-            lines.append("Канал: n/a\n")
-
-        lines.append("💼 Баланс и позиция")
-        lines.append("Торговля: ON")
-        lines.append(f"Итого: ${_fmt_money(snap['equity'])}")
-        lines.append(f"Доступно: ${_fmt_money(snap['available'])}")
-        lines.append(f"В ордерах (BUY, резерв): ${_fmt_money(snap['reserved'])}")
-        lines.append(f"Позиция: {_round(snap['qty'],6)} {BASE_ASSET} AVG: {_round(snap['avg'],6)}")
-        lines.append(f"Стоимость позиции: ${_fmt_money(snap['pos_val'])}\n")
-
-        # Блок PNL — как ты просил
-        lines.append("PNL")
-        lines.append(f"1 час: {_fmt_money(pnl_1h)} ({_fmt_pct(pct_1h)})")
-        lines.append(f"24 часа: {_fmt_money(pnl_24h)} ({_fmt_pct(pct_24h)})")
-        lines.append(f"Всего: {_fmt_money(pnl_all)} ({_fmt_pct(pct_all)})\n")
-
-        # Статистика (как было)
-        buy_cnt = (sessT.query(Order)
-                   .filter(Order.pair==PAIR, Order.side=="BUY",
-                           Order.status.in_(("NEW","PARTIALLY_FILLED"))).count())
-        sell_cnt = (sessT.query(Order)
-                    .filter(Order.pair==PAIR, Order.side=="SELL",
-                            Order.status.in_(("NEW","PARTIALLY_FILLED"))).count())
+        preview = fetch_recent_orders_preview(conn, PAIR, 10)
+        # быстрые счётчики по открытым
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM orders WHERE pair=? AND side='BUY'", (PAIR,))
+        buy_cnt = int(cur.fetchone()[0])
+        cur.execute("SELECT COUNT(*) FROM orders WHERE pair=? AND side='SELL'", (PAIR,))
+        sell_cnt = int(cur.fetchone()[0])
         lines.append("📊 Статистика")
-        lines.append(f"BUY={buy_cnt} | SELL={sell_cnt}\n")
-
-        # Последние 10 ордеров
-        last_orders = (sessT.query(Order)
-                       .filter(Order.pair==PAIR)
-                       .order_by(Order.created.desc())
-                       .limit(10).all())
+        lines.append(f"BUY={buy_cnt} | SELL={sell_cnt}")
         lines.append("10 последних ордеров:")
-        for o in last_orders:
-            t = datetime.fromtimestamp(int(o.created), MSK).strftime("%H:%M:%S")
-            lines.append(f"{t} | {o.side} @ {_round(o.price,6)} | qty={_round(o.qty,6)} | {o.status}")
+        lines.extend(preview)
+    except Exception:
+        pass
 
-        print("\n".join(lines))
+    out = "\n".join(lines)
 
-    finally:
-        sessT.close()
-        sess_core.close()
+    # отправка в ТГ + вывод в stdout
+    _send(out)
+    print(out)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # не проглатываем полностью — покажем в stdout/stderr
+        import traceback
+        msg = f"[report] ERROR: {e}\n{traceback.format_exc()}"
+        try:
+            from notify import send_error
+            send_error("report", msg)
+        except Exception:
+            pass
+        print(msg, file=sys.stderr)
+        sys.exit(1)

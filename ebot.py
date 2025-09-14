@@ -17,7 +17,7 @@ from config import (
 try:
     from notify import send_error, send_message
 except Exception:
-    def send_error(where, e):  # noqa: D401
+    def send_error(where, e):  # fallback в журнал
         print(f"[ERROR] {where}: {e}")
     def send_message(text):
         print(f"[MSG] {text}")
@@ -40,10 +40,18 @@ def run_cmd(name: str, argv: list[str]) -> None:
             msg = f"{name} exit={res.returncode} in {dt:.2f}s\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
             send_error(name, msg)
         else:
-            if res.stdout.strip():
-                print(f"[{name}] {dt:.2f}s STDOUT:\n{res.stdout.strip()}")
-            if res.stderr.strip():
-                print(f"[{name}] {dt:.2f}s STDERR:\n{res.stderr.strip()}")
+            out = (res.stdout or "").strip()
+            err = (res.stderr or "").strip()
+            if out:
+                print(f"[{name}] {dt:.2f}s STDOUT:\n{out}")
+            if err:
+                print(f"[{name}] {dt:.2f}s STDERR:\n{err}")
+            # ⬇️ ключ: отчёт уходит в TG через notify
+            if name == "report" and out:
+                try:
+                    send_message(out)
+                except Exception as e:
+                    send_error("report-notify", e)
     except Exception as e:
         send_error(name, f"{e}\n{traceback.format_exc()}")
 
@@ -60,7 +68,7 @@ def task_report():
     run_cmd("report", [PYBIN, os.path.join(ROOT, "report.py")])
 
 def task_consolidate():
-    # Без аргументов — вся логика и лимиты внутри consolidate.py / config.py
+    # без аргументов — вся конфигурация в config.py
     run_cmd("consolidate", [PYBIN, os.path.join(ROOT, "consolidate.py")])
 
 def _now():
@@ -91,6 +99,7 @@ def main():
     while True:
         now = time.time()
 
+        # sync — чаще всех, проверяем первым
         if ENABLE_SYNC and now >= next_run.get("sync", now + 1e9):
             task_sync()
             next_run["sync"] = time.time() + _jitter(EBOT_SYNC_INTERVAL_SEC)
