@@ -14,7 +14,7 @@ MEXC_WS_URL   = "wss://wbs.mexc.com/ws"
 # === Telegram ===
 TG_BOT_TOKEN = "REPLACE_ME"
 TG_CHAT_ID   = "REPLACE_ME"
-TG_ERROR_COOLDOWN_SEC = 600   # анти-спам ошибок (сек)
+ERROR_COOLDOWN_MIN = 10       # анти-спам ошибок (мин)
 
 # === Exchange API keys (REAL) ===
 API_KEY    = "REPLACE_ME"
