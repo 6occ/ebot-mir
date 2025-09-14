@@ -16,7 +16,7 @@ CHATID = getattr(CFG, "TELEGRAM_CHAT_ID",getattr(CFG, "TG_CHAT_ID",    os.getenv
 PMODE  = getattr(CFG, "TG_PARSE_MODE", "HTML")      # 'HTML' по умолчанию (менее хрупко чем MarkdownV2)
 TG_SILENT_DEFAULT = bool(getattr(CFG, "TG_DISABLE_NOTIFICATION", False))
 
-ERR_COOLDOWN_MIN = int(getattr(CFG, "ERROR_COOLDOWN_MIN", 10))  # мин между повторными ОДИНАКОВЫМИ ошибками
+ERROR_COOLDOWN_MIN = int(getattr(CFG, "ERROR_COOLDOWN_MIN", 10))  # мин между повторными ОДИНАКОВЫМИ ошибками
 STATE_PATH = Path(getattr(CFG, "NOTIFY_STATE_PATH", "/opt/Ebot/tmp/notify_state.json"))
 
 HTTP_TIMEOUT = float(getattr(CFG, "TG_HTTP_TIMEOUT", 5.0))
@@ -132,7 +132,7 @@ def _cooldown_passed(sig: str) -> bool:
     if not entry:
         return True
     last = int(entry.get("ts", 0))
-    return (now - last) >= ERR_COOLDOWN_MIN * 60
+    return (now - last) >= ERROR_COOLDOWN_MIN * 60
 
 def _mark_sent(sig: str):
     st = _read_state()
@@ -143,7 +143,7 @@ def _mark_sent(sig: str):
 def send_error(context: str, exc: Exception, details: Optional[str] = None, silent: Optional[bool] = None) -> bool:
     """
     Отправка ошибки с анти-спамом:
-    - одинаковые сигнатуры не шлём чаще, чем раз в ERR_COOLDOWN_MIN минут;
+    - одинаковые сигнатуры не шлём чаще, чем раз в ERROR_COOLDOWN_MIN минут;
     - новая сигнатура — сразу.
     """
     try:
