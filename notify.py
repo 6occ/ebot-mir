@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, json, time, hashlib, threading
+import os, json, time, hashlib, threading, html
 from pathlib import Path
 from typing import Optional, Tuple
 import requests
@@ -158,7 +158,7 @@ def send_error(context: str, exc: Exception, details: Optional[str] = None, sile
                 )
                 if details:
                     # короткий трейл деталей
-                    d = details.strip()
+                    d = html.escape(details.strip())
                     if len(d) > 800:
                         d = d[:800] + " …"
                     msg += f"\n<pre>{d}</pre>"
