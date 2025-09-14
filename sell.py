@@ -1,179 +1,234 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import math, time
-from datetime import timezone, timedelta
+
+import math
+import time
 from statistics import mean
+from datetime import timezone, timedelta
 from sqlalchemy import and_
+
 from config import (
     PAIR,
     MIN_ORDER_USD,
-    SELL_SPLIT,
-    SELL_MIN_GAIN,
-    SELL_MICROSHIFT,
-    BASE_ASSET,
+
+    # SELL strategy
+    SELL_SPLIT,        # доля на upper (0..1)
+    SELL_MIN_GAIN,     # минимум avg + gain
+    SELL_MICROSHIFT,   # микросдвиг, если уровень занят
+
+    # опционально (не критично для логики, но полезно)
+    # BASE_ASSET, QUOTE_ASSET
 )
-from models_trading import SessionT, Order, Position, init_trading_db
+
 from models import SessionLocal, MinMax
+from models_trading import (
+    SessionT, Order, Position, init_trading_db
+)
 from mexc_client import MexcClient
 from notify import send_error
 
 MSK = timezone(timedelta(hours=3))
 now_ts = lambda: int(time.time())
 
-def floor6(x: float) -> float:
+def _floor6(x: float) -> float:
     return math.floor(float(x) * 1_000_000) / 1_000_000
 
-def round_price(p: float) -> float:
-    return floor6(p)
+def last_price(cli: MexcClient) -> float:
+    return float(cli.price(PAIR))
 
-def last_price(client: MexcClient) -> float:
-    p = float(client.price(PAIR))
-    return max(0.0, p)
-
-def get_24h_bounds():
+def channel_24h() -> tuple[float, float, float]:
+    """
+    Возвращает (lower, upper, mid24) как mid±spread/4 по таблице minmax за 24ч.
+    Если данных нет — (0,0,0).
+    """
     s = SessionLocal()
     try:
         cutoff = now_ts() - 86400
         rows = (s.query(MinMax)
-                .filter(and_(MinMax.pair == PAIR, MinMax.time >= cutoff))
-                .all())
+                  .filter(and_(MinMax.pair == PAIR, MinMax.time >= cutoff))
+                  .all())
         if not rows:
             return 0.0, 0.0, 0.0
         min24 = min(r.min for r in rows)
         max24 = max(r.max for r in rows)
         mid24 = mean(r.mid for r in rows)
-        spread = max24 - min24
-        lower = round_price(mid24 - spread/4.0)
-        upper = round_price(mid24 + spread/4.0)
+        spread = max(0.0, max24 - min24)
+        lower = max(0.0, mid24 - spread/4.0)
+        upper = max(0.0, mid24 + spread/4.0)
         return lower, upper, mid24
     finally:
         s.close()
 
-def fetch_position(sessT):
-    pos = sessT.query(Position).filter(Position.pair==PAIR).first()
+def get_position(sessT: SessionT) -> tuple[float, float]:
+    pos = sessT.query(Position).filter(Position.pair == PAIR).first()
     if not pos:
         return 0.0, 0.0
     return float(pos.qty or 0.0), float(pos.avg or 0.0)
 
-def open_sell_remaining(sessT):
-    opens = (sessT.query(Order)
-             .filter(and_(Order.pair==PAIR,
-                          Order.side=="SELL",
-                          Order.status.in_(("NEW","PARTIALLY_FILLED"))))
-             .all())
-    rem = 0.0
-    for o in opens:
-        q = max(0.0, float(o.qty or 0.0) - float(o.filled_qty or 0.0))
-        rem += q
-    return floor6(rem), opens
+def get_open_sells(sessT: SessionT) -> list[Order]:
+    return (sessT.query(Order)
+            .filter(and_(Order.pair == PAIR,
+                         Order.side == "SELL",
+                         Order.status.in_(("NEW", "PARTIALLY_FILLED"))))
+            .all())
 
-def exchange_free_kas(cli: MexcClient) -> float:
+def exchange_free_base(cli: MexcClient) -> float:
+    """
+    Возвращает свободный базовый ассет (KAS) по данным биржи.
+    """
     acct = cli.account() or {}
-    bals = acct.get("balances") or []
-    for b in bals:
-        if b.get("asset") == BASE_ASSET:
+    for b in (acct.get("balances") or []):
+        # Некоторые клиенты отдают как {'asset': 'KAS', 'free': '...', 'locked': '...'}
+        if str(b.get("asset")).upper() in ("KAS",):
             try:
-                return max(0.0, float(b.get("free") or 0.0))
+                return float(b.get("free") or 0.0)
             except Exception:
                 return 0.0
     return 0.0
 
-def avoid_collision_price(sessT, target_p: float) -> float:
-    p = round_price(target_p)
-    exists = (sessT.query(Order)
-              .filter(and_(Order.pair==PAIR,
-                           Order.side=="SELL",
-                           Order.status.in_(("NEW","PARTIALLY_FILLED")),
-                           Order.price==p))
-              .first())
-    if exists:
-        return round_price(p + SELL_MICROSHIFT)
-    return p
+def place_limit_sell(cli: MexcClient, sessT: SessionT, price: float, qty: float) -> bool:
+    """
+    Отправляет лимитную продажу и фиксирует в локальной БД.
+    """
+    price = max(0.0, float(price))
+    qty = max(0.0, float(qty))
+    if price <= 0 or qty <= 0:
+        return False
 
-def place_limit_sell(cli: MexcClient, sessT, price: float, qty: float):
-    price = round_price(price)
-    qty   = floor6(qty)
-    if qty <= 0 or price <= 0:
+    # проверка минимального номинала
+    notional = price * qty
+    if notional < MIN_ORDER_USD:
         return False
-    if qty * price < MIN_ORDER_USD:
+
+    # квантование количества (6 знаков)
+    qty = _floor6(qty)
+    if qty <= 0:
         return False
-    # биржа
-    resp = cli.place_order(PAIR, "SELL", price, qty)
-    oid  = str(resp.get("orderId") or f"SELL_{now_ts()}")
-    # локально
-    o = Order(id=oid, pair=PAIR, side="SELL", price=price, qty=qty,
-              filled_qty=0.0, status="NEW",
-              created=now_ts(), updated=now_ts(),
-              paper=False, reserved=0.0, mode="GRID")
+
+    resp = cli.place_order(PAIR, "SELL", price=price, qty=qty)
+    oid = str(resp.get("orderId") or f"SELL_{now_ts()}")
+
+    o = Order(
+        id=oid, pair=PAIR, side="SELL",
+        price=float(price), qty=float(qty),
+        status="NEW", created=now_ts(), updated=now_ts(),
+        paper=False, reserved=0.0, filled_qty=0.0, mode="GRID",
+    )
     sessT.merge(o)
     sessT.commit()
     return True
 
-def place_sell_orders():
+def build_sell_prices(pos_avg: float, last: float, upper: float) -> tuple[float, float]:
+    """
+    Возвращает (p_mid, p_upper):
+      - p_mid  = середина между last и upper
+      - p_upper= сам upper
+    Обе цены поджимаются снизу на минимум avg*(1+SELL_MIN_GAIN).
+    """
+    # если верх канала неизвестен — подстрахуемся
+    if not upper or upper <= 0.0:
+        upper = last
+
+    p_mid = (last + upper) / 2.0
+    floor_price = pos_avg * (1.0 + float(SELL_MIN_GAIN))
+
+    p_mid   = max(p_mid, floor_price)
+    p_upper = max(upper, floor_price)
+    return p_mid, p_upper
+
+def main():
     init_trading_db()
-    cli = MexcClient()
+    cli   = MexcClient()
     sessT = SessionT()
+
     try:
         last = last_price(cli)
-        _, upper, _ = get_24h_bounds()
-        pos_qty, pos_avg = fetch_position(sessT)
-        open_rem, _ = open_sell_remaining(sessT)
+        lower, upper, _ = channel_24h()
 
-        # Локально доступно с учётом уже открытых SELL
-        local_avail = floor6(max(0.0, pos_qty - open_rem))
-        # Фактически свободно на бирже
-        exch_free = floor6(exchange_free_kas(cli))
-        # Берём минимум, чтобы не ловить Oversold
-        avail_qty = floor6(min(local_avail, exch_free))
-
-        if avail_qty <= 0:
+        pos_qty, pos_avg = get_position(sessT)
+        if pos_qty <= 0:
             return  # нечего продавать
 
-        # Цели: верх канала и середина last..upper (или last, если upper неизвестен)
-        target_upper = upper if upper > 0 else last
-        target_mid   = (last + target_upper) / 2.0 if target_upper > 0 else last
+        # берём реальный свободный KAS на бирже (защита от "Oversold")
+        free_kas = exchange_free_base(cli)
+        if free_kas <= 0:
+            return
 
-        # «Пол»: не ниже avg*(1+SELL_MIN_GAIN)
-        min_ok = pos_avg * (1.0 + SELL_MIN_GAIN) if pos_avg > 0 else 0.0
-        p1 = max(target_upper, min_ok)
-        p2 = max(target_mid,   min_ok)
+        sellable_qty = min(pos_qty, free_kas)
 
-        # Анти-коллизия (и лёгкое разведение цен)
-        p1 = avoid_collision_price(sessT, p1)
-        p2 = avoid_collision_price(sessT, p2 if abs(p2 - p1) > 1e-12 else (p2 + SELL_MICROSHIFT))
+        # считаем целевые цены
+        p_mid, p_upper = build_sell_prices(pos_avg, last, upper)
 
-        # Разбиение объёма
-        r = max(0.0, min(1.0, SELL_SPLIT))
-        q1 = floor6(avail_qty * r)
-        q2 = floor6(avail_qty - q1)
+        # микросдвиг, если уже есть SELL на этих уровнях
+        open_sells = get_open_sells(sessT)
+        open_prices = {round(float(o.price or 0.0), 6) for o in open_sells}
 
-        placed_any = False
-        if q1 > 0 and q1 * p1 >= MIN_ORDER_USD:
-            placed_any |= place_limit_sell(cli, sessT, p1, q1)
-        if q2 > 0 and q2 * p2 >= MIN_ORDER_USD:
-            placed_any |= place_limit_sell(cli, sessT, p2, q2)
+        # подвинем на SELL_MICROSHIFT, если уровень занят
+        def shift_if_taken(price: float) -> float:
+            p = float(price)
+            # ограничим число сдвигов, чтобы не уйти далеко
+            for _ in range(3):
+                r = round(p, 6)
+                if r not in open_prices:
+                    return p
+                p += float(SELL_MICROSHIFT)
+            return p
 
-        # Если дробление не прошло по мин. сумме — пробуем одним ордером на p1
-        if (not placed_any) and (avail_qty * p1 >= MIN_ORDER_USD):
-            place_limit_sell(cli, sessT, p1, avail_qty)
+        p_mid   = shift_if_taken(p_mid)
+        p_upper = shift_if_taken(p_upper)
 
-    except Exception as e:
-        try: send_error("sell.place", e)
-        except: pass
-        raise
-    finally:
-        sessT.close()
+        # делим количество на две части
+        split = min(max(float(SELL_SPLIT), 0.0), 1.0)
+        q_upper = _floor6(sellable_qty * split)
+        q_mid   = _floor6(sellable_qty - q_upper)
 
-if __name__ == "__main__":
-    place_sell_orders()
+        # проверка минимального номинала для каждой заявки
+        def notional_ok(p, q) -> bool:
+            return (p * q) >= MIN_ORDER_USD and q > 0
 
-# === shim: ensure ebot can call sell.main() ===
-def main():
-    try:
-        place_sell_orders()
+        # если обе не проходят — попробуем объединить в одну заявку на p_mid (ближе к рынку)
+        both_fail = (not notional_ok(p_mid, q_mid)) and (not notional_ok(p_upper, q_upper))
+        if both_fail:
+            q_one = _floor6(sellable_qty)
+            if notional_ok(p_mid, q_one):
+                try:
+                    place_limit_sell(cli, sessT, p_mid, q_one)
+                except Exception as e:
+                    try:
+                        send_error("sell.place", e)
+                    except Exception:
+                        pass
+            return
+
+        # если одна не проходит — переложим объём во вторую
+        if not notional_ok(p_mid, q_mid) and notional_ok(p_upper, q_upper):
+            q_upper = _floor6(q_upper + q_mid)
+            q_mid   = 0.0
+        elif not notional_ok(p_upper, q_upper) and notional_ok(p_mid, q_mid):
+            q_mid   = _floor6(q_mid + q_upper)
+            q_upper = 0.0
+
+        # ставим, что получилось
+        for price, qty in [(p_upper, q_upper), (p_mid, q_mid)]:
+            if notional_ok(price, qty):
+                try:
+                    placed = place_limit_sell(cli, sessT, price, qty)
+                    if not placed:
+                        continue
+                except Exception as e:
+                    try:
+                        send_error("sell.place", e)
+                    except Exception:
+                        pass
+
     except Exception as e:
         try:
             send_error("sell.tick", e)
         except Exception:
             pass
         raise
+    finally:
+        sessT.close()
+
+if __name__ == "__main__":
+    main()

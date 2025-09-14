@@ -1,12 +1,66 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ "$1" == "main" ]; then
-  echo "➡️  Push ONLY to origin/main"
+ROOT="/opt/Ebot"
+cd "$ROOT"
+
+# небольшая проверка наличия remotes
+git remote get-url origin >/dev/null 2>&1 || { echo "❌ no remote 'origin'"; exit 1; }
+git remote get-url mirror >/dev/null 2>&1 || true
+
+# 1) зафиксировать текущую рабочую копию в снапшот
+snapshot() {
+  # добавим всё, что есть в рабочей копии
+  if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    git add -A
+    git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  fi
+  git rev-parse HEAD
+}
+
+SNAP="$(snapshot)"
+CUR_BRANCH="$(git symbolic-ref --quiet --short HEAD || echo '')"
+
+if [[ "${1:-}" == "main" ]]; then
+  echo "➡️  Push ONLY to origin/main (snapshot $SNAP)"
+
+  # убедимся, что локальная main есть и отслеживает origin/main
+  git fetch origin main
+  if ! git show-ref --verify --quiet refs/heads/main; then
+    git branch --track main origin/main || git branch main "$SNAP"
+  fi
+
+  # запомним откуда пришли, чтобы вернуться
+  PREV_REF="$(git rev-parse --abbrev-ref HEAD || true)"
+
+  # переключаемся на main и сливаем снапшот
+  git switch main
+  # сначала пробуем ff, если нельзя — обычный merge с автосообщением
+  if ! git merge --ff "$SNAP" >/dev/null 2>&1; then
+    git merge --no-ff -m "merge snapshot $SNAP" "$SNAP"
+  fi
+
+  # пушим в origin/main
   git push origin main
-else
-  echo "➡️  Push to origin/dev"
-  git push origin dev
-  echo "➡️  Push to mirror/main"
-  git push mirror main
+
+  # возвращаемся куда были
+  if [[ -n "$PREV_REF" && "$PREV_REF" != "HEAD" ]]; then
+    git switch "$PREV_REF" || true
+  fi
+
+  echo "✅ origin/main updated"
+  exit 0
 fi
+
+# по умолчанию: origin/dev и mirror/main
+echo "➡️  Push to origin/dev (snapshot $SNAP)"
+git push origin "$SNAP":refs/heads/dev
+
+if git remote get-url mirror >/dev/null 2>&1; then
+  echo "➡️  Push to mirror/main (snapshot $SNAP)"
+  git push mirror "$SNAP":refs/heads/main
+else
+  echo "ℹ️  remote 'mirror' not set — skip"
+fi
+
+echo "✅ done"

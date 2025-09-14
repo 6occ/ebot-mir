@@ -10,6 +10,7 @@ from config import (
     EBOT_SYNC_INTERVAL_SEC, EBOT_BUY_INTERVAL_SEC, EBOT_SELL_INTERVAL_SEC, EBOT_REPORT_INTERVAL_SEC,
     # consolidator
     ENABLE_CONSOLIDATE, CONSOLIDATE_CHECK_EVERY_SEC,
+    CONSOLIDATE_LIMIT_OVER, CONSOLIDATE_TO_CANCEL, CONSOLIDATE_PLACE_COUNT,
     # jitter
     SCHEDULER_JITTER_MAX_SEC,
 )
@@ -61,8 +62,12 @@ def task_report():
     run_cmd("report", [PYBIN, os.path.join(ROOT, "report.py")])
 
 def task_consolidate():
-    # consolidate.py сам читает лимиты из config.py, дополнительных CLI-флагов не требуется
-    args = [PYBIN, os.path.join(ROOT, "consolidate.py")]
+    args = [
+        PYBIN, os.path.join(ROOT, "consolidate.py"),
+        "--limit-over", str(CONSOLIDATE_LIMIT_OVER),
+        "--to-cancel",  str(CONSOLIDATE_TO_CANCEL),
+        "--place-count", str(CONSOLIDATE_PLACE_COUNT),
+    ]
     run_cmd("consolidate", args)
 
 def _now():
@@ -71,10 +76,7 @@ def _now():
 def main():
     # стартовое сообщение
     try:
-        send_message(
-            f"▶️ ebot started | sync={ENABLE_SYNC} buy={ENABLE_BUY} "
-            f"sell={ENABLE_SELL} report={ENABLE_REPORT} consolidate={ENABLE_CONSOLIDATE} | {_now()}"
-        )
+        send_message(f"▶️ ebot started | sync={ENABLE_SYNC} buy={ENABLE_BUY} sell={ENABLE_SELL} report={ENABLE_REPORT} consolidate={ENABLE_CONSOLIDATE} | {_now()}")
     except Exception:
         pass
 

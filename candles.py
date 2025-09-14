@@ -1,4 +1,5 @@
 import json
+import sys
 import time
 import threading
 import logging
@@ -10,10 +11,18 @@ from datetime import datetime, timezone
 
 from config import (
     PAIR, MEXC_HTTP_URL, MEXC_WS_URL,
-    MAX_CANDLE_GAP, HTTP_TIMEOUT
+    MAX_CANDLE_GAP
 )
 from models import SessionLocal, MinMax, init_db
 from notify import send_error
+import os
+os.makedirs("/opt/Ebot/logs", exist_ok=True)
+
+# --- optional config values with safe defaults ---
+try:
+    from config import HTTP_TIMEOUT  # optional
+except Exception:
+    HTTP_TIMEOUT = 10  # seconds (default)
 
 # --- keepalive ---
 SOCKET_PING_INTERVAL = 15
