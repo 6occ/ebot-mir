@@ -8,7 +8,7 @@
 4) Пересчёт позиции qty/avg из всех fills -> position
 Никаких сообщений в TG. Только БД.
 """
-import time, math, re, logging
+import time, math
 from typing import Dict, List, Tuple
 from sqlalchemy import and_, func
 from models_trading import (
@@ -190,69 +190,17 @@ def recompute_position(sess: SessionT) -> Tuple[float, float]:
     sess.commit()
     return qty, avg
 
-def main(window_min: int = SYNC_WINDOW_MIN, open_limit: int = SYNC_OPEN_LIMIT):
-    try:
-        from logging_config import setup_logging
-        setup_logging()
-    except Exception:
-        pass
-    log = logging.getLogger(__name__)
-    log.info("sync start window_min=%s open_limit=%s", window_min, open_limit)
+def main():
     init_trading_db()
     sess = SessionT()
     cli  = MexcClient()
     try:
-        sync_trades(sess, cli, window_min)
-        sync_open_orders(sess, cli, open_limit)
+        sync_trades(sess, cli, SYNC_WINDOW_MIN)
+        sync_open_orders(sess, cli, SYNC_OPEN_LIMIT)
         sync_balance(sess, cli)
         recompute_position(sess)
     finally:
         sess.close()
 
-def _parse_window_to_minutes(val) -> int:
-    """
-    Принимает человеко-читаемый формат: 90s, 30m, 2h, 1d, либо число (минуты).
-    Возвращает минуты (целое), границы: 1..1440.
-    """
-    if val is None:
-        return int(SYNC_WINDOW_MIN)
-    try:
-        # если пришло число — трактуем как минуты (обратная совместимость)
-        m = int(val)
-        return max(1, min(1440, m))
-    except Exception:
-        pass
-    s = str(val).strip().lower()
-    m = re.fullmatch(r"(\d+)([smhd]?)", s)
-    if not m:
-        return max(1, min(1440, int(SYNC_WINDOW_MIN)))
-    num = int(m.group(1))
-    unit = m.group(2) or "m"
-    if unit == "s":
-        minutes = (num + 59) // 60  # округляем вверх до минуты
-    elif unit == "m":
-        minutes = num
-    elif unit == "h":
-        minutes = num * 60
-    else:  # 'd'
-        minutes = num * 1440
-    return max(1, min(1440, int(minutes)))
-
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="Quiet sync: trades/orders/balance -> DB")
-    ap.add_argument(
-        "--window",
-        default=None,
-        help="Окно импорта сделок: число (минуты) или 90s/30m/2h/1d. По умолчанию config.SYNC_WINDOW_MIN",
-    )
-    ap.add_argument(
-        "--open-limit",
-        type=int,
-        default=SYNC_OPEN_LIMIT,
-        help="Максимум открытых ордеров за раз (по умолчанию из config.SYNC_OPEN_LIMIT)",
-    )
-    args = ap.parse_args()
-    window_min = _parse_window_to_minutes(args.window)
-    open_limit = max(10, min(2000, int(args.open_limit)))
-    main(window_min=window_min, open_limit=open_limit)
+    main()

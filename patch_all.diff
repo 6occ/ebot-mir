@@ -1,0 +1,293 @@
+*** Add File: /opt/Ebot/tools/healthcheck.sh
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="/opt/Ebot"
++cd "$ROOT"
++
++echo "[1/6] Python compileall (syntax check)"
++python3 -X faulthandler -m compileall -q .
++
++echo "[2/6] Ruff/Flake8 (optional)"
++if ! command -v ruff >/dev/null 2>&1; then
++  echo "ruff not found; to install: python3 -m pip install ruff"
++fi
++if command -v ruff >/dev/null 2>&1; then
++  ruff check . || true
++fi
++if ! command -v flake8 >/dev/null 2>&1; then
++  echo "flake8 not found; to install: python3 -m pip install flake8"
++fi
++if command -v flake8 >/dev/null 2>&1; then
++  flake8 || true
++fi
++
++echo "[3/6] mypy (optional)"
++if ! command -v mypy >/dev/null 2>&1; then
++  echo "mypy not found; to install: python3 -m pip install mypy"
++fi
++if command -v mypy >/dev/null 2>&1; then
++  mypy --ignore-missing-imports --install-types --non-interactive || true
++fi
++
++echo "[4/6] Paths and permissions"
++test -d "$ROOT" || { echo "Missing $ROOT"; exit 1; }
++test -f "$ROOT/ebot.py" || { echo "Missing ebot.py"; exit 1; }
++test -w "$ROOT/tmp" || mkdir -p "$ROOT/tmp"
++test -d "$ROOT/logs" || mkdir -p "$ROOT/logs"
++
++echo "[5/6] Config presence"
++if [ ! -f "$ROOT/config.py" ]; then
++  echo "config.py not found (ok if using env), see config.example.py"
++fi
++if grep -qE '(API_KEY|API_SECRET|TG_BOT_TOKEN|TG_CHAT_ID)\s*=\s*\"[A-Za-z0-9]+' "$ROOT/config.py" 2>/dev/null; then
++  echo "WARNING: secrets present in config.py (rotate & move to env)"
++fi
++
++echo "[6/6] SQLite sanity"
++if [ -f "$ROOT/ebot.db" ]; then
++  python3 - <<'PY'
++import sqlite3, sys
++try:
++    con = sqlite3.connect("ebot.db")
++    con.execute("PRAGMA integrity_check;")
++    print("SQLite OK")
++except Exception as e:
++    print("SQLite ERR:", e)
++    sys.exit(0)
++PY
++else
++  echo "No ebot.db yet (ok for fresh setup)"
++fi
++
++echo "Healthcheck finished."
+*** End Patch
+*** Add File: /opt/Ebot/Makefile
++.PHONY: init lint type check test
++
++VENV?=/opt/Ebot/venv
++PY?=$(VENV)/bin/python3
++PIP?=$(VENV)/bin/pip
++
++init:
++	@test -d $(VENV) || python3 -m venv $(VENV)
++	@$(PIP) install -U pip
++	@if [ -f requirements.txt ]; then $(PIP) install -r requirements.txt; fi
++	@$(PIP) install ruff flake8 mypy
++
++lint:
++	@$(VENV)/bin/ruff check .
++	@$(VENV)/bin/flake8
++
++type:
++	@$(VENV)/bin/mypy --ignore-missing-imports --install-types --non-interactive
++
++check:
++	@$(PY) -X faulthandler -m compileall -q .
++
++test:
++	@if [ -d test ]; then $(PY) -m pytest -q || true; else echo "no tests"; fi
+*** End Patch
+*** Add File: /opt/Ebot/tools/dry_run.py
++#!/usr/bin/env python3
++# Offline dry-run: читает последние данные из локальной SQLite без внешних вызовов,
++# считает базовые метрики и печатает краткий отчёт. Ничего не пишет.
++import sqlite3, argparse, time
++from datetime import datetime
++
++def utc_ts() -> int: return int(time.time())
++
++def fetch_last_rows(conn, pair: str, limit: int = 50):
++    cur = conn.cursor()
++    try:
++        cur.execute("SELECT time, close FROM minmax WHERE pair=? ORDER BY time DESC LIMIT ?", (pair, limit))
++        prices = [float(r[1]) for r in cur.fetchall()][::-1]
++    except Exception:
++        prices = []
++    try:
++        cur.execute("SELECT side, price, qty, status FROM orders WHERE pair=? ORDER BY COALESCE(updated,created) DESC LIMIT ?", (pair, limit))
++        orders = cur.fetchall()
++    except Exception:
++        orders = []
++    try:
++        cur.execute("SELECT qty, avg FROM positions WHERE pair=? ORDER BY COALESCE(updated,time) DESC LIMIT 1", (pair,))
++        r = cur.fetchone()
++        pos = (float(r[0] or 0.0), float(r[1] or 0.0)) if r else (0.0, 0.0)
++    except Exception:
++        pos = (0.0, 0.0)
++    return prices, orders, pos
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--db", default="ebot.db")
++    ap.add_argument("--pair", default="KASUSDC")
++    args = ap.parse_args()
++    conn = sqlite3.connect(args.db)
++    prices, orders, (qty, avg) = fetch_last_rows(conn, args.pair)
++    last = prices[-1] if prices else None
++    pnl = (last - avg) * qty if (last is not None and avg) else 0.0
++    print(f"DRY-RUN @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
++    print(f"PAIR={args.pair} last={last if last is not None else 'n/a'} qty={qty} avg={avg} pnl_usd={pnl:.2f}")
++    print(f"orders(last {len(orders)}):", len(orders))
++
++if __name__ == "__main__":
++    main()
+*** End Patch
+*** Add File: /opt/Ebot/accounting.py
++# -*- coding: utf-8 -*-
++from typing import Iterable, Tuple, Optional, Dict
++
++def compute_position_from_fills(fills: Iterable[Dict]) -> Tuple[float, float]:
++    """
++    fills: iterable of dicts with keys: side ('BUY'|'SELL'), qty, price, fee (optional)
++    Returns: (qty, avg_cost_price)
++    """
++    qty = 0.0
++    cost = 0.0
++    for f in fills:
++        side = str(f.get("side","")).upper()
++        q = float(f.get("qty") or 0.0)
++        p = float(f.get("price") or 0.0)
++        fee = float(f.get("fee") or 0.0)
++        if side == "BUY":
++            qty  += q
++            cost += q * p + fee
++        else:
++            if qty <= 0.0:
++                qty = 0.0; cost = 0.0
++                continue
++            sell_q = min(qty, q)
++            avg = (cost/qty) if qty > 1e-12 else 0.0
++            cost -= avg * sell_q
++            qty  -= sell_q
++    avg = (cost/qty) if qty > 1e-12 else 0.0
++    return qty, avg
++
++def estimate_equity_usd(start_capital_usd: float, last_price: Optional[float], qty: float, avg: float, reserve_usd: float = 0.0) -> Tuple[float, float]:
++    """Returns (equity_total_usd, cash_estimate_usd)."""
++    last = float(last_price or 0.0)
++    position_val = last * qty
++    total_equity_est = start_capital_usd + (last - avg) * qty if avg and last else start_capital_usd
++    cash_est = max(0.0, total_equity_est - position_val - float(reserve_usd or 0.0))
++    return total_equity_est, cash_est
++
++def compute_pnl(last_price: float, qty: float, ref_price: Optional[float]):
++    if ref_price is None:
++        return None, None
++    abs_usd = (float(last_price) - float(ref_price)) * float(qty)
++    base = max(1e-9, float(last_price) * float(qty))
++    pct = (abs_usd / base) * 100.0
++    return abs_usd, pct
+*** End Patch
+*** Add File: /opt/Ebot/scripts/calc_balances.py
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++import argparse, sqlite3
++from datetime import datetime
++from typing import List, Dict
++from accounting import compute_position_from_fills, estimate_equity_usd, compute_pnl
++
++def fetch_fills(conn, pair: str, ts_from: int|None, ts_to: int|None) -> List[Dict]:
++    cur = conn.cursor()
++    q = "SELECT side, price, qty, COALESCE(fee,0.0), ts FROM fills WHERE pair=?"
++    params = [pair]
++    if ts_from is not None:
++        q += " AND ts>=?"; params.append(int(ts_from))
++    if ts_to is not None:
++        q += " AND ts<=?"; params.append(int(ts_to))
++    q += " ORDER BY ts ASC, id ASC"
++    try:
++        cur.execute(q, params)
++        return [{"side": r[0], "price": float(r[1]), "qty": float(r[2]), "fee": float(r[3]), "ts": int(r[4])} for r in cur.fetchall()]
++    except Exception:
++        return []
++
++def fetch_last_close(conn, pair: str):
++    cur = conn.cursor()
++    try:
++        cur.execute("SELECT time, close FROM minmax WHERE pair=? ORDER BY time DESC LIMIT 1", (pair,))
++        r = cur.fetchone()
++        return (int(r[0]), float(r[1])) if r else (None, None)
++    except Exception:
++        return (None, None)
++
++def main():
++    ap = argparse.ArgumentParser(description="Offline balance/fees calculation")
++    ap.add_argument("--db", default="ebot.db")
++    ap.add_argument("--pair", default="KASUSDC")
++    ap.add_argument("--from", dest="ts_from", type=int, default=None, help="unix ts from")
++    ap.add_argument("--to", dest="ts_to", type=int, default=None, help="unix ts to")
++    ap.add_argument("--print-summary", action="store_true")
++    ap.add_argument("--start-capital", type=float, default=1000.0)
++    args = ap.parse_args()
++
++    conn = sqlite3.connect(args.db)
++    fills = fetch_fills(conn, args.pair, args.ts_from, args.ts_to)
++    qty, avg = compute_position_from_fills(fills)
++    _, last = fetch_last_close(conn, args.pair)
++    equity, cash = estimate_equity_usd(args.start_capital, last, qty, avg, 0.0)
++    pnl_abs, pnl_pct = compute_pnl(last or 0.0, qty, avg)
++    if args.print_summary:
++        print(f"Summary @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
++    print(f"PAIR={args.pair} qty={qty} avg={avg:.6f} last={last if last is not None else 'n/a'}")
++    print(f"equity_usd={equity:.2f} cash_est={cash:.2f} pnl_abs={pnl_abs if pnl_abs is not None else 'n/a'} pnl_pct={pnl_pct if pnl_pct is not None else 'n/a'}")
++
++if __name__ == "__main__":
++    main()
+*** End Patch
+*** Update File: /opt/Ebot/sync.py
+@@
+-def main():
+-    init_trading_db()
+-    sess = SessionT()
+-    cli  = MexcClient()
+-    try:
+-        sync_trades(sess, cli, SYNC_WINDOW_MIN)
+-        sync_open_orders(sess, cli, SYNC_OPEN_LIMIT)
+-        sync_balance(sess, cli)
+-        recompute_position(sess)
+-    finally:
+-        sess.close()
++def main(window_min: int = SYNC_WINDOW_MIN, open_limit: int = SYNC_OPEN_LIMIT):
++    init_trading_db()
++    sess = SessionT()
++    cli  = MexcClient()
++    try:
++        sync_trades(sess, cli, window_min)
++        sync_open_orders(sess, cli, open_limit)
++        sync_balance(sess, cli)
++        recompute_position(sess)
++    finally:
++        sess.close()
+@@
+-if __name__ == "__main__":
+-    main()
++if __name__ == "__main__":
++    import argparse
++    ap = argparse.ArgumentParser(description="Quiet sync: trades/orders/balance -> DB")
++    ap.add_argument("--window", type=int, default=SYNC_WINDOW_MIN,
++                    help="Окно импорта сделок, минут (по умолчанию из config.SYNC_WINDOW_MIN)")
++    ap.add_argument("--open-limit", type=int, default=SYNC_OPEN_LIMIT,
++                    help="Максимум открытых ордеров за раз (по умолчанию из config.SYNC_OPEN_LIMIT)")
++    args = ap.parse_args()
++
++    window_min = max(1, min(60*24, int(args.window)))
++    open_limit = max(10, min(2000, int(args.open_limit)))
++    main(window_min=window_min, open_limit=open_limit)
+*** End Patch
+*** Update File: /opt/Ebot/README.md
+@@
++### Быстрый офлайн-чек проекта
++1. Создать venv и установить тулзы:
++   - `make init`
++2. Базовые проверки синтаксиса:
++   - `make check`
++3. Линтеры (по желанию):
++   - `make lint`
++4. Типы (по желанию):
++   - `make type`
++5. Healthcheck (пути/конфиги/SQLite):
++   - `bash tools/healthcheck.sh`
++6. Офлайн-сводка по данным:
++   - `python3 tools/dry_run.py --db ebot.db --pair KASUSDC`
++   - `python3 scripts/calc_balances.py --db ebot.db --pair KASUSDC --print-summary`
+*** End Patch
