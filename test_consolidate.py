@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-import subprocess, sys, runpy, os
+import subprocess
+import sys
+import runpy
+import os
 
 def run(cmd, shell=False):
     print(f"\n=== RUN: {cmd if shell else ' '.join(cmd)} ===")

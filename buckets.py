@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, time, math, random
+import sys
+import time
+import math
+import random
 from typing import List, Tuple
 from sqlalchemy import and_
 
@@ -12,7 +15,8 @@ from mexc_client import MexcClient
 from models_trading import SessionT, Order, init_trading_db
 from notify import send_error
 
-NOW = lambda: int(time.time())
+def NOW():
+    return int(time.time())
 
 def _floor6(x: float) -> float:
     return math.floor(float(x) * 1_000_000) / 1_000_000

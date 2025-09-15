@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, glob, sqlite3, argparse, re, types
+import os
+import sys
+import glob
+import sqlite3
+import argparse
+import types
 from importlib.machinery import SourceFileLoader
 from typing import Optional, Tuple
 

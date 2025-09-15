@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, html, logging
+import sys
+import html
+import logging
 
 from reports import run as run_report
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import math, time, random
+import math
+import time
+import random
 # removed: timezone,timedelta (unused)
 from statistics import mean
 from sqlalchemy import and_
@@ -25,7 +27,8 @@ from models_trading import SessionT, Order, Capital, init_trading_db
 from mexc_client import MexcClient
 from notify import send_error
 
-now_ts = lambda: int(time.time())
+def now_ts():
+    return int(time.time())
 
 def _floor6(x: float) -> float:
     return math.floor(float(x) * 1_000_000) / 1_000_000

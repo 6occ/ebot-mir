@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time, math
+import time
+import math
 from sqlalchemy import and_
 
 from config import PAIR, BASE_ASSET, MIN_ORDER_USD
 from mexc_client import MexcClient
 from models_trading import SessionT, Order, Position, init_trading_db
 
-TS = lambda: int(time.time())
+def TS():
+    return int(time.time())
 
 def floor6(x: float) -> float:
     return math.floor(float(x) * 1_000_000) / 1_000_000

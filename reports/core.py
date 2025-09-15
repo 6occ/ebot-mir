@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import sqlite3
 import time
-from typing import List, Tuple, Optional, Dict
+from typing import List, Optional
 from statistics import mean
 from datetime import datetime, timezone, timedelta
 

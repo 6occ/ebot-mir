@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import sqlite3, argparse, time
+import sqlite3
+import argparse
+import time
 from datetime import datetime
 
 try:

@@ -8,7 +8,10 @@
 4) Пересчёт позиции qty/avg из всех fills -> position
 Никаких сообщений в TG. Только БД.
 """
-import time, math, re, logging
+import time
+import math
+import re
+import logging
 from typing import Dict, List, Tuple
 from sqlalchemy import and_, func
 from models_trading import (
@@ -20,8 +23,10 @@ from config import (
     SYNC_WINDOW_MIN, SYNC_OPEN_LIMIT,
 )
 
-now_s  = lambda: int(time.time())
-now_ms = lambda: int(time.time()*1000)
+def now_s():
+    return int(time.time())
+def now_ms():
+    return int(time.time()*1000)
 
 def _to_float(x):
     try: return float(x)
@@ -74,7 +79,7 @@ def sync_trades(sess: SessionT, cli: MexcClient, window_min: int) -> int:
 # ---- OPEN ORDERS -> orders (upsert + filled_qty) ----
 def _fills_by_order(sess: SessionT) -> Dict[str, Dict[str, float]]:
     rows = (sess.query(Fill.order_id, Fill.side, func.sum(Fill.qty))
-                .filter(and_(Fill.pair == PAIR, Fill.order_id != None))
+                .filter(and_(Fill.pair == PAIR, Fill.order_id is not None))
                 .group_by(Fill.order_id, Fill.side)
                 .all())
     agg: Dict[str, Dict[str, float]] = {}

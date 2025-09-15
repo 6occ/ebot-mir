@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, time, random, subprocess, traceback, shlex, sys, atexit, logging
+import os
+import time
+import random
+import subprocess
+import traceback
+import shlex
+import sys
+import atexit
+import logging
 from datetime import datetime
 
 PID_FILE = "/tmp/ebot.pid"

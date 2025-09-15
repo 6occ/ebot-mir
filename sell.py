@@ -28,7 +28,8 @@ from mexc_client import MexcClient
 from notify import send_error
 
 MSK = timezone(timedelta(hours=3))
-now_ts = lambda: int(time.time())
+def now_ts():
+    return int(time.time())
 
 def _floor6(x: float) -> float:
     return math.floor(float(x) * 1_000_000) / 1_000_000
